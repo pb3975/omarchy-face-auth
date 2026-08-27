@@ -1,0 +1,188 @@
+#!/bin/bash
+
+# omarchy:summary=Set up face authentication for sudo, polkit, and lock screen
+# omarchy:requires-sudo=true
+
+set -e
+
+
+# A clamshell gate runs before pam_howdy in every stack: when the lid is shut
+# the IR camera is looking at the keyboard, so it skips face (success=1) and
+# PAM drops straight to the password prompt instead of burning Howdy's whole
+# capture timeout on a black frame. Lid open → face, then password as the
+# fallback.
+#
+# pam_exec needs a literal absolute path (no env expansion). Point at the fixed
+# /usr/bin path the omarchy package always provides, so the gate keeps working
+# across package installs and dev-link — the latter overlays $OMARCHY_PATH
+# trees but leaves /usr/bin untouched.
+face_gate="auth      [success=1 default=ignore] pam_exec.so quiet /usr/bin/omarchy-hw-laptop-closed"
+
+# success=1 skips exactly one line, so the gate only ever protects the single
+# module directly beneath it. Fingerprint may already own a gate of its own in
+# the same file, which is why the idempotency check below can't just look for
+# omarchy-hw-laptop-closed anywhere in the file — it has to find one sitting
+# immediately above *our* module.
+has_face_gate() {
+  grep -B1 'pam_howdy\.so' "$1" 2>/dev/null | grep -q 'omarchy-hw-laptop-closed'
+}
+
+setup_pam_config() {
+  # Configure sudo. Inserting at line 1 puts face ahead of any pam_fprintd
+  # block already in the file: both are sufficient, so the first one to match
+  # ends the stack, and the camera answers without the user touching anything.
+  if ! grep -q 'pam_howdy\.so' /etc/pam.d/sudo; then
+    echo "Configuring sudo for face authentication..."
+    sudo sed -i '1i auth      sufficient pam_howdy.so' /etc/pam.d/sudo
+  fi
+  if ! has_face_gate /etc/pam.d/sudo; then
+    echo "Adding clamshell gate to sudo..."
+    # Insert immediately before pam_howdy so success=1 skips exactly it, and
+    # not whatever fingerprint put on the next line down.
+    sudo sed -i "/pam_howdy\.so/i $face_gate" /etc/pam.d/sudo
+  fi
+
+  # Configure polkit
+  if [[ -f /etc/pam.d/polkit-1 ]]; then
+    if ! grep -q 'pam_howdy\.so' /etc/pam.d/polkit-1; then
+      echo "Configuring polkit for face authentication..."
+      sudo sed -i '1i auth      sufficient pam_howdy.so' /etc/pam.d/polkit-1
+    fi
+    if ! has_face_gate /etc/pam.d/polkit-1; then
+      echo "Adding clamshell gate to polkit..."
+      sudo sed -i "/pam_howdy\.so/i $face_gate" /etc/pam.d/polkit-1
+    fi
+  else
+    echo "Creating polkit configuration with face authentication..."
+    sudo tee /etc/pam.d/polkit-1 >/dev/null <<EOF
+$face_gate
+auth      sufficient pam_howdy.so
+auth      required pam_unix.so
+
+account   required pam_unix.so
+password  required pam_unix.so
+session   required pam_unix.so
+EOF
+  fi
+}
+
+setup_lock_face_pam() {
+  # The lock plugin polls for this file: its existence is the whole contract
+  # for "face auth is configured", which is why it's written only after an
+  # enrollment that verified.
+  #
+  # Lid open: pam_howdy is sufficient, so a match ends the stack right here.
+  # A miss falls through to pam_deny, which fails this service immediately —
+  # the lock screen's separate password stack is untouched and still unlocks.
+  # Lid closed: the gate skips over pam_howdy straight to pam_deny, so the
+  # service fails without ever opening the camera.
+  echo "Configuring lock screen for face authentication..."
+  sudo tee /etc/pam.d/omarchy-lock-face >/dev/null <<'EOF'
+#%PAM-1.0
+auth       [success=1 default=ignore]  pam_exec.so quiet /usr/bin/omarchy-hw-laptop-closed
+auth       sufficient                  pam_howdy.so
+auth       required                    pam_deny.so
+account    include                     system-local-login
+EOF
+}
+
+setup_howdy_device() {
+  local device="$1" config=/etc/howdy/config.ini
+
+  # /etc/howdy is root-only (0700) by design — pam_howdy expects its config and
+  # models to stay out of user reach — so even the existence test needs sudo.
+  if ! sudo test -f "$config"; then
+    echo -e "\e[31mHowdy installed but $config is missing — cannot point it at the IR camera.\e[0m"
+    exit 1
+  fi
+
+  echo "Pointing Howdy at $device..."
+
+  # Howdy defaults device_path to none and would otherwise be pointed at the
+  # RGB webcam, which is both the wrong sensor and the photo-spoofable one.
+  # Rewrite in place, scoped to the [video] section so nothing else in the
+  # file moves, and rewrite rather than append so running setup twice — or
+  # after a replug that renumbered /dev/video* — lands on one correct value
+  # instead of stacking duplicates.
+  if sudo sed -n '/^\[video\]/,/^\[/p' "$config" |
+    grep -Eq '^[[:space:]]*#?[[:space:]]*device_path[[:space:]]*='; then
+    sudo sed -i -E "/^\[video\]/,/^\[/ s|^[[:space:]]*#?[[:space:]]*device_path[[:space:]]*=.*|device_path = $device|" "$config"
+  else
+    sudo sed -i "/^\[video\]/a device_path = $device" "$config"
+  fi
+}
+
+
+echo -e "\e[32mSetting up IR camera for face authentication.\n\e[0m"
+
+# v4l-utils is what the probe below reads formats with, and without it the
+# probe can only answer "no". It's a few hundred KB from the official repos and
+# installs no daemon, so pulling it in ahead of the hardware gate is a cheaper
+# trade than never detecting an IR camera at all. Everything expensive — the
+# AUR build, the models — still waits behind the gate.
+if ! command -v v4l2-ctl &>/dev/null; then
+  echo "Installing required packages..."
+  omarchy-pkg-add v4l-utils
+fi
+
+# Bail before building anything if there's no IR sensor to talk to. The probe
+# prints the camera's persistent by-path node, which is what Howdy gets
+# configured with further down.
+if ! ir_device=$(omarchy-hw-ir-camera); then
+  echo -e "\e[31mNo IR camera detected.\e[0m"
+  exit 1
+fi
+
+echo "Found IR camera at $ir_device"
+
+# howdy-next is the native C++ rewrite of Howdy. Its PKGBUILD already ships the
+# systemd drop-in that works around polkit >= 127 sandboxing the agent away
+# from /dev/video*, so there's nothing to do about that here.
+echo "Installing Howdy from the AUR (this compiles, give it a few minutes)..."
+omarchy-pkg-aur-add howdy-next
+
+# The package ships an empty /usr/share/howdy/models — the ONNX detection and
+# recognition models are fetched from upstream on demand. Enrollment can't work
+# without them, so a failed download has to stop setup here, while nothing on
+# the system has been changed yet.
+echo "Downloading face recognition models..."
+sudo howdy download-models
+
+setup_howdy_device "$ir_device"
+
+# Enroll a face
+echo -e "\e[32m\nLet's capture your face as the first model.\e[0m"
+echo -e "Look straight at the camera and hold still until the capture completes.\n"
+
+if sudo howdy add; then
+  echo -e "\e[32m\nFace enrolled successfully!\e[0m"
+
+  # Verify
+  echo -e "\nNow let's verify that it's working correctly.\n"
+  if sudo howdy test; then
+    # PAM comes last, once a face is enrolled and verified. Detection only
+    # proves an IR node is there, not that Howdy can match against it — a
+    # sensor that strobes too dark, or a model captured in bad light, gets
+    # this far and then never matches. Editing the stacks up front would
+    # leave those machines waiting on a camera that can't answer before every
+    # password prompt.
+    setup_pam_config
+    setup_lock_face_pam
+    echo -e "\e[32m\nPerfect! Face authentication is now configured.\e[0m"
+    echo "You can use your face for sudo, polkit, and lock screen (Super + Ctrl + L)."
+    echo -e "\n\e[31mWorth knowing:\e[0m Howdy is meaningfully weaker than Windows Hello — there's"
+    echo "no fused depth sensor, and photo and video spoofs have worked against some"
+    echo "setups. It's wired in as sufficient everywhere, never required, so your"
+    echo "password stays the real credential and the fallback on every prompt."
+    echo "It does not unlock Bitwarden or any other vault — that's master-password only."
+  else
+    echo -e "\e[31m\nVerification failed. You may want to try enrolling again.\e[0m"
+    # Nothing has been written to /etc/pam.d yet, so the system is exactly
+    # where it started. Fail loudly so a scripted caller doesn't read this as
+    # a working setup.
+    exit 1
+  fi
+else
+  echo -e "\e[31m\nEnrollment failed. Please try again.\e[0m"
+  exit 1
+fi

@@ -1,0 +1,82 @@
+#!/bin/bash
+
+# omarchy:summary=Remove face authentication from sudo, polkit, and lock screen
+# omarchy:requires-sudo=true
+
+set -e
+
+
+# Drop every pam_howdy line, and drop a clamshell gate only where it is ours —
+# meaning the line directly beneath it is the pam_howdy line it was written to
+# protect. A gate sitting above pam_fprintd belongs to fingerprint and has to
+# survive, otherwise removing face auth silently breaks fingerprint's
+# lid-closed fallback in the same file.
+#
+# (omarchy-remove-security-fingerprint has the mirror image of this bug: it
+# deletes every omarchy-hw-laptop-closed line in the file, ours included. Not
+# our script to fix, but it means running `omarchy remove security fingerprint`
+# on a machine with face auth configured will strip our gate and leave
+# pam_howdy ungated. Re-running setup puts it back.)
+strip_face_awk='
+  /omarchy-hw-laptop-closed/ {
+    # Two gates in a row means the first one guards the second, not a module
+    # of ours, so it stays.
+    if (pending != "") print pending
+    pending = $0
+    next
+  }
+  /pam_howdy\.so/ {
+    # The module goes, and so does the gate held above it, if any.
+    pending = ""
+    next
+  }
+  {
+    if (pending != "") { print pending; pending = "" }
+    print
+  }
+  END { if (pending != "") print pending }
+'
+
+strip_face_from() {
+  local file="$1" tmp
+
+  grep -q 'pam_howdy\.so' "$file" 2>/dev/null || return 0
+
+  echo "Removing face authentication from ${2}..."
+  tmp=$(mktemp)
+  sudo awk "$strip_face_awk" "$file" >"$tmp"
+  # cp onto the original keeps its inode, owner, and mode; mv would replace
+  # them with the temp file's user-owned 0600.
+  sudo cp "$tmp" "$file"
+  rm -f "$tmp"
+}
+
+remove_pam_config() {
+  strip_face_from /etc/pam.d/sudo sudo
+  [[ -f /etc/pam.d/polkit-1 ]] && strip_face_from /etc/pam.d/polkit-1 polkit
+  return 0
+}
+
+remove_lock_face_pam() {
+  if [[ -f /etc/pam.d/omarchy-lock-face ]]; then
+    echo "Removing lock screen face authentication..."
+    # The lock plugin polls for this file, so deleting it is what turns the
+    # face path off there — no shell restart needed.
+    sudo rm -f /etc/pam.d/omarchy-lock-face
+  fi
+}
+
+
+echo -e "\e[32mRemoving IR camera from authentication.\n\e[0m"
+
+remove_pam_config
+remove_lock_face_pam
+
+echo "Removing face packages..."
+# Enrolled face models under /etc/howdy stay on disk, orphaned — same posture
+# as removing fingerprint, which leaves enrolled prints in /var/lib/fprint.
+# `sudo howdy clear` wipes them, but that's the user's call, not a side effect
+# of unwiring PAM.
+omarchy-pkg-drop howdy-next
+
+echo -e "\e[32mFace authentication has been completely removed.\e[0m"

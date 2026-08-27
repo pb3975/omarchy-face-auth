@@ -1,0 +1,78 @@
+#!/bin/bash
+
+# omarchy:summary=Returns true when an IR camera is present
+# omarchy:hidden=true
+
+# v4l2-ctl (v4l-utils) is the only portable way to ask a V4L2 node which pixel
+# formats it can produce — sysfs exposes the device but not its format list.
+# Hardware probes have to stay side-effect free, because the first-run invite
+# hook runs them on every machine, so a missing v4l2-ctl reads as "can't tell,
+# assume no" rather than as a reason to install something. The face setup
+# script pulls v4l-utils in itself before it calls this.
+command -v v4l2-ctl &>/dev/null || exit 1
+
+# Windows-Hello-style IR sensors present as their own capture node exposing
+# nothing but raw greyscale, alongside an RGB node on the same USB device that
+# offers MJPG/YUYV. Matching on "greyscale and nothing else" instead of on the
+# vendor's card name keeps this off one laptop's naming quirks: an RGB webcam
+# always advertises a colour format, so it can never win here, which is what
+# keeps RGB-only machines out of a much weaker (photo-spoofable) setup.
+is_greyscale_only() {
+  local formats fourcc
+
+  # v4l2-ctl prints one "	[0]: 'GREY' (8-bit Greyscale)" line per format.
+  formats=$(v4l2-ctl -d "$1" --list-formats 2>/dev/null |
+    sed -n "s/.*\[[0-9]\+\]: '\([^']*\)'.*/\1/p")
+
+  # Metadata and control-only nodes (/dev/video1 and /dev/video3 on the ASUS
+  # this was built against) enumerate zero capture formats. Nothing at all is
+  # not "only greyscale" — without this they'd every one of them match.
+  [[ -n $formats ]] || return 1
+
+  while read -r fourcc; do
+    # GREY plus the Y8/Y10/Y12/Y14/Y16 depth variants, including the padded
+    # and interleaved spellings ('Y16 ', 'Y10B', 'Y8I'). YUYV and YU12 start
+    # with a Y too, which is why the digit right after it is required rather
+    # than matching a bare Y* prefix.
+    [[ $fourcc =~ ^(GREY|Y[0-9]+[A-Z]?[[:space:]]*)$ ]] || return 1
+  done <<<"$formats"
+
+  return 0
+}
+
+# /dev/videoN numbering is assigned in probe order and moves when a USB device
+# is replugged or a second camera appears, so anything persisted into a config
+# file has to be the by-path name instead.
+by_path_for() {
+  local node="$1" link fallback=""
+
+  for link in /dev/v4l/by-path/*; do
+    [[ -e $link ]] || continue
+    [[ $(readlink -f "$link") == "$node" ]] || continue
+
+    # udev emits two aliases for the same node, pci-…-usb-…  and
+    # pci-…-usbv2-…. The plain usb- form is the long-standing one, so prefer
+    # it and fall back to the usbv2 alias only when it's all that's there.
+    if [[ ${link##*/} == *-usbv2-* ]]; then
+      [[ -n $fallback ]] || fallback="$link"
+    else
+      echo "$link"
+      return 0
+    fi
+  done
+
+  [[ -n $fallback ]] && echo "$fallback" && return 0
+  return 1
+}
+
+for node in /dev/video*; do
+  [[ -c $node ]] || continue
+  is_greyscale_only "$node" || continue
+
+  # Callers using this as a plain hardware gate ignore stdout; the face setup
+  # script reads it to point Howdy at the IR node instead of the RGB one.
+  by_path_for "$node" || echo "$node"
+  exit 0
+done
+
+exit 1

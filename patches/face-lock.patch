@@ -1,0 +1,317 @@
+# Adds a Howdy IR face-auth path to the Omarchy lock plugin, alongside the
+# built-in password and fingerprint PAM flows.
+#
+# Generated against the upstream files listed in patches/UPSTREAM_SHA256.
+# Re-apply after an Omarchy update with:
+#
+#   cp /usr/share/omarchy/shell/plugins/lock/{Service,LockView}.qml .
+#   patch -p1 <patches/face-lock.patch
+#
+--- a/LockView.qml
++++ b/LockView.qml
+@@ -9,6 +9,8 @@
+   property string backgroundPath: ""
+   property int backgroundVersion: 0
+   property bool fingerprintConfigured: false
++  property bool faceConfigured: false
++  property bool faceAuthenticating: false
+   property bool authenticatingPassword: false
+   property string failureMessage: ""
+   property int failedAttempts: 0
+@@ -27,6 +29,9 @@
+   // Space to keep clear on each side of the field for the fingerprint icon
+   // (icon width plus a gap) so the centered dots never run under it.
+   readonly property real fingerprintReserve: fingerprintConfigured ? Math.round(fingerprintIcon.implicitWidth + 12) : 0
++  // The face hint takes the opposite edge, and is reserved on both sides the
++  // same way, so the two hints together still leave the dots centered.
++  readonly property real faceReserve: faceConfigured ? Math.round(faceIcon.implicitWidth + 12) : 0
+   // Shrink the dots to fit once the password outgrows the field, so every
+   // keystroke stays visible — otherwise long passwords clip with no feedback.
+   readonly property real passwordDotScale: dotMetrics.advanceWidth > 0
+@@ -133,11 +138,11 @@
+         id: passwordInput
+         anchors.fill: parent
+         anchors.topMargin: inputField.borderTop
+-        // Reserve the fingerprint icon's width on both sides so the centered
+-        // dots stay symmetric and never slide under the icon as they grow.
+-        anchors.rightMargin: inputField.borderRight + 18 + root.fingerprintReserve
++        // Reserve the hint icons' width on both sides so the centered dots stay
++        // symmetric and never slide under an icon as they grow.
++        anchors.rightMargin: inputField.borderRight + 18 + root.fingerprintReserve + root.faceReserve
+         anchors.bottomMargin: inputField.borderBottom
+-        anchors.leftMargin: inputField.borderLeft + 18 + root.fingerprintReserve
++        anchors.leftMargin: inputField.borderLeft + 18 + root.fingerprintReserve + root.faceReserve
+         verticalAlignment: TextInput.AlignVCenter
+         horizontalAlignment: TextInput.AlignHCenter
+         activeFocusOnPress: true
+@@ -210,6 +215,27 @@
+         color: Color.lock.placeholder
+         font.family: Style.font.family
+         font.pixelSize: Math.round(root.fieldFontSize * 1.1)
++        horizontalAlignment: Text.AlignHCenter
++        verticalAlignment: Text.AlignVCenter
++      }
++
++      // Face hint on the field's opposite edge when a face is enrolled. It
++      // brightens only while the camera is actually looking: the fingerprint
++      // reader stays armed for the whole lock, so a steady icon tells the truth
++      // there, but the face scan rests between bursts and a steady icon would
++      // promise a camera that is not on.
++      Text {
++        id: faceIcon
++        objectName: "faceIndicator"
++        anchors.left: parent.left
++        anchors.leftMargin: inputField.borderLeft + 18
++        anchors.verticalCenter: parent.verticalCenter
++        visible: root.faceConfigured
++        opacity: root.faceAuthenticating ? 1 : 0.5
++        text: "󰱻"
++        color: Color.lock.placeholder
++        font.family: Style.font.family
++        font.pixelSize: Math.round(root.fieldFontSize * 1.1)
+         horizontalAlignment: Text.AlignHCenter
+         verticalAlignment: Text.AlignVCenter
+       }
+--- a/Service.qml
++++ b/Service.qml
+@@ -15,13 +15,20 @@
+   readonly property string stateHome: home + "/.local/state"
+   readonly property string userName: Quickshell.env("USER") || Quickshell.env("LOGNAME")
+   readonly property string currentBackgroundLink: stateHome + "/omarchy/current/background"
++  // Starting the face PAM runs the IR camera for real -- emitter on, a few
++  // seconds of capture, then a timeout -- so it gets a small burst of tries and
++  // then rests, rather than the fingerprint reader's open-ended retry loop.
++  readonly property int faceAttemptBudget: 3
+ 
+   property bool lockRequested: false
+   property bool pendingSessionLock: false
+   property bool authenticatingPassword: false
+   property bool fingerprintAuthenticating: false
++  property bool faceAuthenticating: false
+   property bool passwordPamConfigured: false
+   property bool fingerprintConfigured: false
++  property bool faceConfigured: false
++  property int faceAttempts: 0
+   property bool previewVisible: false
+   property string enteredPassword: ""
+   property string pendingPassword: ""
+@@ -33,9 +40,10 @@
+   property string lastEventAt: ""
+   property bool strandedLock: false
+   property bool strandedLockResolved: false
++  property bool displayBlanked: false
+ 
+   readonly property bool locked: lockRequested || sessionLock.locked || sessionLock.secure
+-  readonly property bool authenticating: authenticatingPassword || fingerprintAuthenticating
++  readonly property bool authenticating: authenticatingPassword || fingerprintAuthenticating || faceAuthenticating
+ 
+   function realScreenCount() {
+     var screens = Quickshell.screens || []
+@@ -107,6 +115,10 @@
+     if (!fingerprintCheckProc.running) fingerprintCheckProc.running = true
+   }
+ 
++  function refreshFaceStatus() {
++    if (!faceCheckProc.running) faceCheckProc.running = true
++  }
++
+   function logEvent(event) {
+     lastEvent = event
+     lastEventAt = new Date().toISOString()
+@@ -120,9 +132,13 @@
+     failedAttempts = 0
+     authenticatingPassword = false
+     fingerprintAuthenticating = false
++    faceAuthenticating = false
++    faceAttempts = 0
+     fingerprintRetryTimer.stop()
++    faceRetryTimer.stop()
+     if (passwordPam.active) passwordPam.abort()
+     if (fingerprintPam.active) fingerprintPam.abort()
++    if (facePam.active) facePam.abort()
+   }
+ 
+   function beginLock() {
+@@ -140,6 +156,7 @@
+     Qt.callLater(function() {
+       root.refreshBackground()
+       root.refreshFingerprintStatus()
++      root.refreshFaceStatus()
+     })
+ 
+     return true
+@@ -165,11 +182,21 @@
+   }
+ 
+   function runWake() {
++    // A blanked panel coming back is the one signal the lock has that someone
++    // is in front of it again, so it is where the face scan earns another
++    // burst. Every wake source feeds through here -- key press, pointer, the
++    // click that focuses the field -- and the blanked edge keeps a drifting
++    // mouse from restarting the camera on every frame.
++    var wasBlanked = displayBlanked
++    displayBlanked = false
++
+     if (!wakeProcess.running) wakeProcess.running = true
+     if (lockRequested) armBlankTimer()
++    if (wasBlanked) rearmFace()
+   }
+ 
+   function runBlank() {
++    displayBlanked = true
+     if (!blankProcess.running) blankProcess.running = true
+   }
+ 
+@@ -227,6 +254,40 @@
+     }
+   }
+ 
++  function startFace() {
++    if (!lockRequested || !sessionLock.secure || !faceConfigured) return
++    if (facePam.active || faceAuthenticating) return
++    if (faceAttempts >= faceAttemptBudget) return
++
++    faceAttempts += 1
++    faceAuthenticating = true
++    if (!facePam.start()) {
++      faceAuthenticating = false
++    }
++  }
++
++  function handleFaceFinished(result) {
++    faceAuthenticating = false
++
++    if (!lockRequested) return
++    if (result === PamResult.Success) {
++      finishUnlock()
++    } else if (faceConfigured && faceAttempts < faceAttemptBudget) {
++      faceRetryTimer.restart()
++    }
++  }
++
++  // Hands the camera a fresh budget once the opening burst has run out. A
++  // password check in flight already owns the unlock, so it is left to finish
++  // rather than raced -- typing is always the way through.
++  function rearmFace() {
++    if (!lockRequested || !faceConfigured || authenticatingPassword) return
++
++    faceAttempts = 0
++    faceRetryTimer.stop()
++    startFace()
++  }
++
+   WlSessionLock {
+     id: sessionLock
+ 
+@@ -239,6 +300,7 @@
+         sessionLockStabilizeTimer.stop()
+         pendingSessionLockTimer.stop()
+         root.startFingerprint()
++        root.startFace()
+       }
+     }
+ 
+@@ -271,6 +333,8 @@
+         backgroundPath: root.backgroundPath
+         backgroundVersion: root.backgroundVersion
+         fingerprintConfigured: root.fingerprintConfigured
++        faceConfigured: root.faceConfigured
++        faceAuthenticating: root.faceAuthenticating
+         authenticatingPassword: root.authenticatingPassword
+         failureMessage: root.failureMessage
+         failedAttempts: root.failedAttempts
+@@ -301,6 +365,8 @@
+       backgroundPath: root.backgroundPath
+       backgroundVersion: root.backgroundVersion
+       fingerprintConfigured: root.fingerprintConfigured
++      faceConfigured: root.faceConfigured
++      faceAuthenticating: false
+       authenticatingPassword: false
+       failureMessage: ""
+       failedAttempts: 0
+@@ -353,6 +419,21 @@
+     }
+   }
+ 
++  PamContext {
++    id: facePam
++    config: "omarchy-lock-face"
++    user: root.userName
++
++    onCompleted: function(result) {
++      root.handleFaceFinished(result)
++    }
++
++    onError: function(error) {
++      root.faceAuthenticating = false
++      if (root.lockRequested && root.faceConfigured && root.faceAttempts < root.faceAttemptBudget) faceRetryTimer.restart()
++    }
++  }
++
+   Timer {
+     id: fingerprintRetryTimer
+     interval: 250
+@@ -360,6 +441,16 @@
+     onTriggered: root.startFingerprint()
+   }
+ 
++  Timer {
++    id: faceRetryTimer
++    // Longer than the fingerprint's quarter second: back-to-back captures leave
++    // the user no room to sit up or open their eyes, and the emitter would stay
++    // lit straight through the gap.
++    interval: 1500
++    repeat: false
++    onTriggered: root.startFace()
++  }
++
+   Process {
+     id: readlinkProc
+     command: ["readlink", "-f", root.currentBackgroundLink]
+@@ -387,6 +478,21 @@
+   }
+ 
+   Process {
++    id: faceCheckProc
++    // The enrolled model is root-only, so there is no user-readable list to ask
++    // the way fprintd-list answers for fingerprints. Setup writes this file only
++    // once an enroll and a verify have both passed, and removal deletes it, so
++    // its presence is the whole answer.
++    command: ["bash", "-c", "if [[ -f /etc/pam.d/omarchy-lock-face ]]; then echo yes; else echo no; fi"]
++    stdout: StdioCollector { id: faceCheckStdout; waitForEnd: true }
++    onExited: {
++      root.faceConfigured = String(faceCheckStdout.text || "").trim() === "yes"
++      if (root.lockRequested && root.faceConfigured) root.startFace()
++      else if (!root.faceConfigured && facePam.active) facePam.abort()
++    }
++  }
++
++  Process {
+     id: strandedLockCheckProc
+     command: ["bash", "-c", "omarchy-hyprland-session-locked"]
+     onExited: function(exitCode) {
+@@ -504,6 +610,7 @@
+   Component.onCompleted: {
+     refreshBackground()
+     refreshFingerprintStatus()
++    refreshFaceStatus()
+     checkStrandedLock()
+   }
+ 
+@@ -530,6 +637,8 @@
+         realScreens: root.realScreenCount(),
+         passwordPam: root.passwordPamConfigured,
+         fingerprint: root.fingerprintConfigured,
++        face: root.faceConfigured,
++        faceAttempts: root.faceAttempts,
+         authenticating: root.authenticating,
+         lastEvent: root.lastEvent,
+         lastEventAt: root.lastEventAt
+@@ -539,6 +648,7 @@
+     function preview(): string {
+       root.refreshBackground()
+       root.refreshFingerprintStatus()
++      root.refreshFaceStatus()
+       root.previewVisible = true
+       return "ok"
+     }
