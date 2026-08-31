@@ -19,23 +19,20 @@ commands=(
 
 echo -e "\e[32mInstalling omarchy face authentication.\n\e[0m"
 
-# The registry keeps the executable bit off the checked-in sources, so the
-# scripts only become runnable at install time.
-chmod +x "${commands[@]/#/$repo_root/scripts/}"
-
 # The omarchy CLI discovers subcommands by scanning its own directory — the
 # resolved location of `omarchy` on $PATH (/usr/share/omarchy/bin on a stock
-# install), NOT /usr/bin. Link there so `omarchy setup security face` routes,
+# install), NOT /usr/bin. Install there so `omarchy setup security face` routes,
 # and into /usr/bin as well: that's the fixed path PAM's pam_exec gate lines
 # and other scripts can rely on across package installs and dev-link.
-# Symlinks rather than copies so editing the repo takes effect immediately.
+# These must be root-owned copies, not symlinks into the user-writable checkout:
+# the setup and removal commands are expected to run with elevated privileges.
 omarchy_bin_dir=$(dirname -- "$(command -v omarchy)")
 for command in "${commands[@]}"; do
-  echo "Linking $command into $omarchy_bin_dir..."
-  sudo ln -sf "$repo_root/scripts/$command" "$omarchy_bin_dir/$command"
+  echo "Installing $command into $omarchy_bin_dir..."
+  sudo install -o root -g root -m 0755 "$repo_root/scripts/$command" "$omarchy_bin_dir/$command"
   if [[ $omarchy_bin_dir != /usr/bin ]]; then
-    echo "Linking $command into /usr/bin..."
-    sudo ln -sf "$repo_root/scripts/$command" "/usr/bin/$command"
+    echo "Installing $command into /usr/bin..."
+    sudo install -o root -g root -m 0755 "$repo_root/scripts/$command" "/usr/bin/$command"
   fi
 done
 

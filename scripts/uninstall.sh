@@ -38,13 +38,19 @@ fi
 omarchy_bin_dir=$(dirname -- "$(command -v omarchy)")
 for command in "${commands[@]}"; do
   for dir in "$omarchy_bin_dir" /usr/bin; do
-    link="$dir/$command"
-    # Only reclaim a symlink that points back into this checkout. A real file
-    # there is somebody else's (a packaged omarchy command, say) and is not
-    # ours to delete.
-    if [[ -L $link && $(readlink -f "$link") == "$repo_root/scripts/$command" ]]; then
-      echo "Removing $link..."
-      sudo rm -f "$link"
+    installed_command="$dir/$command"
+    # Remove a root-owned copy only while it still matches this checkout, so a
+    # packaged or locally replaced command with the same name is left alone.
+    # The symlink branch cleans up installs made before commands were copied.
+    if [[ -f $installed_command && ! -L $installed_command ]] &&
+      [[ $(stat -c %u:%g "$installed_command") == 0:0 ]] &&
+      cmp -s "$repo_root/scripts/$command" "$installed_command"; then
+      echo "Removing $installed_command..."
+      sudo rm -f "$installed_command"
+    elif [[ -L $installed_command ]] &&
+      [[ $(readlink -f "$installed_command") == "$repo_root/scripts/$command" ]]; then
+      echo "Removing legacy symlink $installed_command..."
+      sudo rm -f "$installed_command"
     fi
   done
 done
