@@ -23,8 +23,23 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Parse shell scripts
-        run: bash -n scripts/*.sh scripts/omarchy-*
+      - name: Parse shell and packaging scripts
+        run: |
+          bash -n scripts/*.sh scripts/omarchy-*
+          bash -n packaging/howdy-next/PKGBUILD
+
+      - name: Keep local pins aligned with the verified inputs
+        run: |
+          set -euo pipefail
+          grep -Fq "$HOWDY_COMMIT" packaging/howdy-next/PKGBUILD
+          grep -Fq "$HOWDY_SOURCE_SHA256" packaging/howdy-next/PKGBUILD
+          grep -Fq "$YUNET_SHA256" scripts/omarchy-setup-security-face
+          grep -Fq "$SFACE_SHA256" scripts/omarchy-setup-security-face
+          grep -Fq 'DeviceAllow=char-video4linux rw' packaging/howdy-next/polkit-camera.conf
+          if grep -R -E 'omarchy-pkg-aur-add[[:space:]]+howdy-next|omarchy[[:space:]]+pkg[[:space:]]+aur[[:space:]]+add[[:space:]]+howdy-next' scripts packaging; then
+            echo "::error::mutable AUR installation path for howdy-next is forbidden"
+            exit 1
+          fi
 
       - name: Resolve immutable source archive hash
         run: |
