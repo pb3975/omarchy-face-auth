@@ -4,7 +4,7 @@
 # the lock plugin. It does not touch PAM — see the warning below — because
 # unwiring authentication is a decision, not cleanup.
 
-set -e
+set -euo pipefail
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 plugin_id=$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$repo_root/manifest.json" | head -1)
@@ -54,6 +54,19 @@ for command in "${commands[@]}"; do
     fi
   done
 done
+
+# Remove the root-owned packaging recipe only when it still matches this
+# checkout. A newer/replaced recipe is left in place rather than deleting data
+# this uninstall script did not install.
+howdy_package_dir=/usr/share/omarchy-face-auth/howdy-next
+if [[ -f $howdy_package_dir/PKGBUILD && -f $howdy_package_dir/polkit-camera.conf ]] &&
+  [[ $(stat -c %u:%g "$howdy_package_dir/PKGBUILD") == 0:0 ]] &&
+  [[ $(stat -c %u:%g "$howdy_package_dir/polkit-camera.conf") == 0:0 ]] &&
+  cmp -s "$repo_root/packaging/howdy-next/PKGBUILD" "$howdy_package_dir/PKGBUILD" &&
+  cmp -s "$repo_root/packaging/howdy-next/polkit-camera.conf" "$howdy_package_dir/polkit-camera.conf"; then
+  echo "Removing pinned Howdy packaging data..."
+  sudo rm -rf -- /usr/share/omarchy-face-auth
+fi
 
 if [[ -n $plugin_id && -L $plugins_dir/$plugin_id ]] &&
   [[ $(readlink -f "$plugins_dir/$plugin_id") == "$repo_root" ]]; then
