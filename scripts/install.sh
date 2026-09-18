@@ -5,7 +5,7 @@
 # face, edit PAM, or enable the plugin, so installing is always reversible by
 # running scripts/uninstall.sh and nothing else.
 
-set -e
+set -euo pipefail
 
 repo_root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 plugin_id=$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$repo_root/manifest.json" | head -1)
@@ -36,6 +36,20 @@ for command in "${commands[@]}"; do
   fi
 done
 
+# The privileged setup command must never execute packaging instructions from
+# the user-writable plugin checkout. Install the audited Howdy recipe and its
+# systemd drop-in as root-owned data, then let setup copy those files into an
+# unprivileged throwaway makepkg workspace when it is time to build.
+howdy_package_dir=/usr/share/omarchy-face-auth/howdy-next
+echo "Installing pinned Howdy packaging data into $howdy_package_dir..."
+sudo install -d -o root -g root -m 0755 "$howdy_package_dir"
+sudo install -o root -g root -m 0644 \
+  "$repo_root/packaging/howdy-next/PKGBUILD" \
+  "$howdy_package_dir/PKGBUILD"
+sudo install -o root -g root -m 0644 \
+  "$repo_root/packaging/howdy-next/polkit-camera.conf" \
+  "$howdy_package_dir/polkit-camera.conf"
+
 # The lock plugin has to live under ~/.config/omarchy/plugins to be found.
 # A symlink to the repo is safe here and is what keeps local edits live:
 # omarchy-plugin-catalog walks the directory with `find -L`, and the shell's
@@ -61,7 +75,7 @@ cat <<EOF
 $(echo -e "\e[32mInstalled.\e[0m") Next steps:
 
   1. omarchy setup security face
-     Detects the IR camera, installs howdy-next, enrolls and verifies your
+     Detects the IR camera, builds pinned howdy-next 3.4.0, enrolls and verifies your
      face, then wires PAM for sudo, polkit, and the lock screen.
 
   2. omarchy plugin enable $plugin_id
