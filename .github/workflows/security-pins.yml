@@ -13,9 +13,10 @@ jobs:
     timeout-minutes: 10
     env:
       HOWDY_COMMIT: b0b3d290cbd38a0a44f6bf0a37b414210acf8276
-      YUNET_URL: https://raw.githubusercontent.com/opencv/opencv_zoo/26cc381e4d2594bb9f47a26eb8fd96c94a13660d/models/face_detection_yunet/face_detection_yunet_2026may.onnx
+      HOWDY_SOURCE_SHA256: bfd1e5f3c379bb99e5df13ac086e1e4b90c07f4f474131293327a84346428144
+      YUNET_URL: https://github.com/opencv/opencv_zoo/raw/26cc381e4d2594bb9f47a26eb8fd96c94a13660d/models/face_detection_yunet/face_detection_yunet_2026may.onnx
       YUNET_SHA256: ebafce4e3c118d6554634be5c27ab333b4c047a9a8c3faf1d7cf93101c22f0f0
-      SFACE_URL: https://raw.githubusercontent.com/opencv/opencv_zoo/088c3571ec70df15100a5e4c26894d95951e92e9/models/face_recognition_sface/face_recognition_sface_2021dec_int8.onnx
+      SFACE_URL: https://github.com/opencv/opencv_zoo/raw/088c3571ec70df15100a5e4c26894d95951e92e9/models/face_recognition_sface/face_recognition_sface_2021dec_int8.onnx
       SFACE_SHA256: 2b0e941e6f16cc048c20aee0c8e31f569118f65d702914540f7bfdc14048d78a
     steps:
       - uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
@@ -31,7 +32,7 @@ jobs:
           curl -fsSL --retry 3 \
             "https://github.com/LonerTZ/howdy-next/archive/${HOWDY_COMMIT}.tar.gz" \
             -o /tmp/howdy-next.tar.gz
-          printf 'HOWDY_SOURCE_SHA256=%s\n' "$(sha256sum /tmp/howdy-next.tar.gz | awk '{print $1}')"
+          printf '%s  %s\n' "$HOWDY_SOURCE_SHA256" /tmp/howdy-next.tar.gz | sha256sum -c -
 
       - name: Verify pinned model artifacts
         run: |
