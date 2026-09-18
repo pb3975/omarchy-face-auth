@@ -2,7 +2,7 @@
   "schemaVersion": 1,
   "id": "io.github.pb3975.face-auth",
   "name": "Face Auth",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "author": "Will Metz",
   "license": "MIT",
   "description": "Quickshell session lock with Howdy IR face authentication alongside the built-in password and fingerprint PAM flows.",
