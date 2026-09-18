@@ -1,0 +1,69 @@
+# Maintained by the omarchy-face-auth plugin.
+# This deliberately does not consume the mutable AUR howdy-next PKGBUILD.
+# The source archive is an immutable upstream commit with a verified SHA-256;
+# build/runtime dependencies come only from pacman's signed Arch repositories.
+
+pkgname=howdy-next
+pkgver=3.4.0
+pkgrel=1
+pkgdesc="C++ facial-recognition authentication for Linux (pinned for Omarchy Face Auth)"
+arch=('x86_64')
+url="https://github.com/LonerTZ/howdy-next"
+license=('MIT')
+depends=(
+  'acl'
+  'curl'
+  'gcc-libs'
+  'glibc'
+  'libevdev'
+  'libinih'
+  'opencv>=5.0.0'
+  'openssl'
+  'pam'
+  'yyjson>=0.12.0'
+)
+makedepends=(
+  'cmake>=3.31'
+  'gcc'
+  'gettext'
+  'make'
+  'pkgconf'
+)
+provides=('howdy')
+conflicts=('howdy')
+backup=('etc/howdy/config.ini')
+
+_commit='b0b3d290cbd38a0a44f6bf0a37b414210acf8276'
+source=(
+  "howdy-next-${_commit}.tar.gz::https://github.com/LonerTZ/howdy-next/archive/${_commit}.tar.gz"
+  'polkit-camera.conf'
+)
+sha256sums=(
+  'bfd1e5f3c379bb99e5df13ac086e1e4b90c07f4f474131293327a84346428144'
+  'dad4094facd14281880a28bcaab3806f1dfeae8b30c06ed480db7f8e5456b4ce'
+)
+
+build() {
+  cmake \
+    -S "howdy-next-${_commit}" \
+    -B build \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_INSTALL_PREFIX=/usr \
+    -DHOWDY_GIT_COMMIT="${_commit}" \
+    -DBUILD_TESTING=ON
+  cmake --build build --parallel "$(nproc)"
+}
+
+check() {
+  ctest --test-dir build --output-on-failure
+}
+
+package() {
+  DESTDIR="${pkgdir}" cmake --install build
+
+  # polkit >=127 starts the PAM helper with a private /dev. Limit the exception
+  # to Video4Linux character devices; the package manager removes this drop-in
+  # with howdy-next.
+  install -Dm644 "${srcdir}/polkit-camera.conf" \
+    "${pkgdir}/etc/systemd/system/polkit-agent-helper@.service.d/50-howdy-camera.conf"
+}
