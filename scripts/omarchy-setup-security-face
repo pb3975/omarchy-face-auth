@@ -31,7 +31,7 @@ install_pinned_howdy() {
   # official Arch repositories rather than executing mutable AUR build code.
   build_dir=$(mktemp -d)
   cleanup_howdy_build() { rm -rf -- "$build_dir"; }
-  trap cleanup_howdy_build RETURN
+  trap cleanup_howdy_build EXIT
 
   cp -- "$howdy_package_dir/PKGBUILD" "$howdy_package_dir/polkit-camera.conf" "$build_dir/"
 
@@ -52,7 +52,7 @@ install_pinned_howdy() {
   )
 
   sudo systemctl daemon-reload
-  trap - RETURN
+  trap - EXIT
   cleanup_howdy_build
 }
 
