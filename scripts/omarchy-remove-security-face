@@ -38,17 +38,40 @@ strip_face_awk='
 '
 
 strip_face_from() {
-  local file="$1" tmp
+  local file="$1" label="$2"
 
-  grep -q 'pam_howdy\.so' "$file" 2>/dev/null || return 0
+  sudo grep -q 'pam_howdy\\.so' "$file" 2>/dev/null || return 0
 
-  echo "Removing face authentication from ${2}..."
-  tmp=$(mktemp)
-  sudo awk "$strip_face_awk" "$file" >"$tmp"
-  # cp onto the original keeps its inode, owner, and mode; mv would replace
-  # them with the temp file's user-owned 0600.
-  sudo cp "$tmp" "$file"
-  rm -f "$tmp"
+  echo "Removing face authentication from ${label}..."
+
+  # Keep the full read/transform/validate/publish transaction inside one root
+  # process. The candidate is root-created beside the target and published by
+  # an atomic same-filesystem rename, so no user-writable temporary path ever
+  # crosses the privilege boundary.
+  sudo bash -c '
+    set -euo pipefail
+    file=$1
+    program=$2
+    dir=$(dirname -- "$file")
+    base=$(basename -- "$file")
+    tmp=$(mktemp -- "$dir/.${base}.face-auth.XXXXXX")
+
+    cleanup() { rm -f -- "$tmp"; }
+    trap cleanup EXIT HUP INT TERM
+
+    awk "$program" "$file" >"$tmp"
+
+    if grep -q "pam_howdy\\.so" "$tmp"; then
+      echo "Refusing to publish PAM rewrite: pam_howdy.so is still present in $file" >&2
+      exit 1
+    fi
+
+    # Preserve the original owner/group/mode plus any ACLs and xattrs without
+    # copying the original contents over the transformed candidate.
+    cp --attributes-only --preserve=all -- "$file" "$tmp"
+    mv -f -- "$tmp" "$file"
+    trap - EXIT HUP INT TERM
+  ' _ "$file" "$strip_face_awk"
 }
 
 remove_pam_config() {
