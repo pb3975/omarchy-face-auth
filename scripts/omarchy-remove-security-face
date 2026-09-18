@@ -3,7 +3,7 @@
 # omarchy:summary=Remove face authentication from sudo, polkit, and lock screen
 # omarchy:requires-sudo=true
 
-set -e
+set -euo pipefail
 
 
 # Drop every pam_howdy line, and drop a clamshell gate only where it is ours —
@@ -101,5 +101,6 @@ echo "Removing face packages..."
 # `sudo howdy clear` wipes them, but that's the user's call, not a side effect
 # of unwiring PAM.
 omarchy-pkg-drop howdy-next
+sudo systemctl daemon-reload
 
 echo -e "\e[32mFace authentication has been completely removed.\e[0m"
