@@ -3,7 +3,82 @@
 # omarchy:summary=Set up face authentication for sudo, polkit, and lock screen
 # omarchy:requires-sudo=true
 
-set -e
+set -euo pipefail
+
+readonly howdy_package_dir=/usr/share/omarchy-face-auth/howdy-next
+readonly howdy_version=3.4.0
+readonly howdy_commit=b0b3d290cbd38a0a44f6bf0a37b414210acf8276
+readonly yunet_model=/usr/share/howdy/models/face_detection_yunet_2026may.onnx
+readonly yunet_sha256=ebafce4e3c118d6554634be5c27ab333b4c047a9a8c3faf1d7cf93101c22f0f0
+readonly yunet_size=229738
+readonly sface_model=/usr/share/howdy/models/face_recognition_sface_2021dec_int8.onnx
+readonly sface_sha256=2b0e941e6f16cc048c20aee0c8e31f569118f65d702914540f7bfdc14048d78a
+readonly sface_size=9896933
+
+install_pinned_howdy() {
+  local build_dir package
+
+  if [[ ! -f $howdy_package_dir/PKGBUILD || ! -f $howdy_package_dir/polkit-camera.conf ]]; then
+    echo -e "\\e[31mPinned Howdy packaging files are missing from $howdy_package_dir.\\e[0m" >&2
+    echo "Re-run scripts/install.sh from the plugin checkout before setup." >&2
+    exit 1
+  fi
+
+  # The recipe installed by install.sh is root-owned. Copy it into a throwaway
+  # user-owned build directory because makepkg correctly refuses to build as
+  # root. The recipe itself pins the upstream v3.4.0 commit archive by SHA-256;
+  # all compiler/runtime dependencies are then resolved from pacman's signed
+  # official Arch repositories rather than executing mutable AUR build code.
+  build_dir=$(mktemp -d)
+  cleanup_howdy_build() { rm -rf -- "$build_dir"; }
+  trap cleanup_howdy_build RETURN
+
+  cp -- "$howdy_package_dir/PKGBUILD" "$howdy_package_dir/polkit-camera.conf" "$build_dir/"
+
+  echo "Verifying pinned Howdy $howdy_version source before build..."
+  (
+    cd "$build_dir"
+    makepkg --verifysource
+    makepkg --syncdeps --cleanbuild --force --noconfirm
+
+    package=$(find . -maxdepth 1 -type f \
+      -name "howdy-next-${howdy_version}-1-x86_64.pkg.tar.*" \
+      ! -name "*-debug-*" -print -quit)
+    if [[ -z $package ]]; then
+      echo "Pinned Howdy package build completed without the expected package artifact." >&2
+      exit 1
+    fi
+    sudo pacman -U --noconfirm -- "$package"
+  )
+
+  sudo systemctl daemon-reload
+  trap - RETURN
+  cleanup_howdy_build
+}
+
+verify_model_artifact() {
+  local path="$1" expected_hash="$2" expected_size="$3" actual_hash actual_size
+
+  sudo test -f "$path" || {
+    echo "Required Howdy model is missing: $path" >&2
+    return 1
+  }
+
+  actual_hash=$(sudo sha256sum -- "$path" | awk '{print $1}')
+  actual_size=$(sudo stat -c %s -- "$path")
+
+  if [[ $actual_hash != "$expected_hash" || $actual_size != "$expected_size" ]]; then
+    echo "Refusing unverified Howdy model: $path" >&2
+    echo "  expected sha256=$expected_hash size=$expected_size" >&2
+    echo "  actual   sha256=$actual_hash size=$actual_size" >&2
+    return 1
+  fi
+}
+
+verify_pinned_models() {
+  verify_model_artifact "$yunet_model" "$yunet_sha256" "$yunet_size"
+  verify_model_artifact "$sface_model" "$sface_sha256" "$sface_size"
+}
 
 
 # A clamshell gate runs before pam_howdy in every stack: when the lid is shut
@@ -135,18 +210,17 @@ fi
 
 echo "Found IR camera at $ir_device"
 
-# howdy-next is the native C++ rewrite of Howdy. Its PKGBUILD already ships the
-# systemd drop-in that works around polkit >= 127 sandboxing the agent away
-# from /dev/video*, so there's nothing to do about that here.
-echo "Installing Howdy from the AUR (this compiles, give it a few minutes)..."
-omarchy-pkg-aur-add howdy-next
+# Build the audited Howdy release from the root-owned pinned recipe installed
+# with this plugin. This avoids executing the mutable AUR PKGBUILD entirely.
+echo "Building pinned Howdy $howdy_version from upstream commit $howdy_commit..."
+install_pinned_howdy
 
-# The package ships an empty /usr/share/howdy/models — the ONNX detection and
-# recognition models are fetched from upstream on demand. Enrollment can't work
-# without them, so a failed download has to stop setup here, while nothing on
-# the system has been changed yet.
-echo "Downloading face recognition models..."
+# Howdy v3.4.0 embeds immutable OpenCV Zoo revisions plus expected SHA-256 and
+# byte sizes. Its downloader verifies them before publishing. Re-check those
+# same values here so the plugin's own security boundary is explicit too.
+echo "Downloading and verifying pinned face recognition models..."
 sudo howdy download-models
+verify_pinned_models
 
 setup_howdy_device "$ir_device"
 
