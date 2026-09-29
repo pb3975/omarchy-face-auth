@@ -40,7 +40,7 @@ strip_face_awk='
 strip_face_from() {
   local file="$1" label="$2"
 
-  sudo grep -q 'pam_howdy\\.so' "$file" 2>/dev/null || return 0
+  sudo grep -q 'pam_howdy\.so' "$file" 2>/dev/null || return 0
 
   echo "Removing face authentication from ${label}..."
 
@@ -80,6 +80,20 @@ remove_pam_config() {
   return 0
 }
 
+# Dropping howdy-next while any PAM stack still loads pam_howdy.so would leave
+# that stack pointing at a missing module, so refuse to go further until every
+# reference is gone.
+assert_no_face_pam() {
+  local remaining
+  remaining=$(sudo grep -l 'pam_howdy\.so' /etc/pam.d/* 2>/dev/null || true)
+  [[ -z $remaining ]] && return 0
+
+  echo "pam_howdy.so is still referenced by:" >&2
+  echo "$remaining" >&2
+  echo "Leaving howdy-next installed. Remove those lines, then rerun this command." >&2
+  exit 1
+}
+
 remove_lock_face_pam() {
   if [[ -f /etc/pam.d/omarchy-lock-face ]]; then
     echo "Removing lock screen face authentication..."
@@ -94,6 +108,7 @@ echo -e "\e[32mRemoving IR camera from authentication.\n\e[0m"
 
 remove_pam_config
 remove_lock_face_pam
+assert_no_face_pam
 
 echo "Removing face packages..."
 # Enrolled face models under /etc/howdy stay on disk, orphaned — same posture
